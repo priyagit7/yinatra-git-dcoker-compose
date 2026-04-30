@@ -1,0 +1,40 @@
+# ============================================================
+# docker-compose.yml
+# App Type   : Docker Compose
+# Deploy Type: EC2 Instance  (also referenced by ECS workflow)
+#
+# What this file does:
+#   - Defines all the services (containers) your app needs
+#   - nginx service: serves your HTML app on port 80
+#   - Environment variables are read from a .env file (never
+#     commit real secrets — only commit .env.example)
+# ============================================================
+
+version: "3.9"
+
+services:
+
+  # ── Web / Nginx service ───────────────────────────────────
+  web:
+    build:
+      context: .           # Use the Dockerfile in the same folder
+      dockerfile: Dockerfile
+    container_name: yinatra-web
+    restart: unless-stopped   # Auto-restart if container crashes
+    ports:
+      - "80:80"            # EC2 public port 80 → container port 80
+    environment:
+      - APP_ENV=${APP_ENV:-production}   # fallback to "production" if not set
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - yinatra-net
+
+# ── Shared network ────────────────────────────────────────
+networks:
+  yinatra-net:
+    driver: bridge
