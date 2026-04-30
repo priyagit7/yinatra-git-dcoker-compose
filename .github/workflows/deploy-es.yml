@@ -1,0 +1,253 @@
+# ============================================================
+# .github/workflows/deploy-ecs.yml
+# Deploy Type : ECS Fargate (Private)
+# App Type    : Docker Compose
+#
+# ── WHAT THIS WORKFLOW DOES (step by step) ──────────────────
+#
+#  TRIGGER: Push to main OR manual trigger from Yinatra/GitHub
+#
+#  STEP 1 – Checkout
+#    Downloads your repo code to the GitHub Actions runner
+#
+#  STEP 2 – Apply Yinatra dispatch overrides
+#    When Yinatra triggers this workflow, it passes ECS cluster
+#    name, service name, ECR repo, etc. as inputs.
+#    This step writes them into GitHub's environment so all
+#    later steps can use them.
+#
+#  STEP 3 – Configure AWS credentials (OIDC)
+#    Same OIDC authentication as the EC2 workflow.
+#    github-actions-deployer role is used here too.
+#
+#  STEP 4 – Login to Amazon ECR
+#    Gets a Docker login token for your private ECR registry.
+#    ECR is AWS's private Docker image registry (like Docker Hub
+#    but private and inside your AWS account).
+#
+#  STEP 5 – Set image tag and URI
+#    Determines which image tag to build/deploy.
+#    Full URI format: 942049393866.dkr.ecr.ap-south-1.amazonaws.com/repo:tag
+#
+#  STEP 6 – Build and push Docker image to ECR
+#    Builds the image from your Dockerfile.
+#    Pushes it to ECR so ECS can pull it when launching containers.
+#    (ECS Fargate runs containers directly from ECR — it cannot
+#     use images from your local machine or S3)
+#
+#  STEP 7 – Update ECS task definition
+#    ECS uses a "task definition" — a JSON blueprint that says:
+#      - Which Docker image to run
+#      - How much CPU/memory to give it
+#      - What environment variables to set
+#      - Which ports to expose
+#    This step registers a NEW task definition revision with the
+#    updated image URI.
+#
+#  STEP 8 – Update ECS service
+#    Points the ECS service at the new task definition.
+#    ECS will gradually replace running containers with new ones
+#    (rolling deployment — no downtime).
+#
+#  STEP 9 – Wait for ECS service to stabilize
+#    Waits until all ECS tasks are running the new version
+#    and are healthy. Fails the workflow if it doesn't stabilize.
+# ============================================================
+
+name: Build & Deploy to ECS Fargate (Docker Compose)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: 'Phase: build (build+push+deploy) or deploy (use existing image)'
+        required: false
+        default: 'build'
+        type: string
+      pipeline_run_id:
+        description: 'Yinatra pipeline run ID'
+        required: false
+        default: ''
+        type: string
+      image_tag:
+        description: 'Docker image tag to build or deploy'
+        required: false
+        default: ''
+        type: string
+      ecs_cluster:
+        description: 'ECS cluster name (Yinatra passes this)'
+        required: false
+        default: ''
+        type: string
+      ecs_service:
+        description: 'ECS service name (Yinatra passes this)'
+        required: false
+        default: ''
+        type: string
+      aws_account_id:
+        description: 'AWS account ID (Yinatra passes this)'
+        required: false
+        default: ''
+        type: string
+      aws_region:
+        description: 'AWS region (Yinatra passes this)'
+        required: false
+        default: ''
+        type: string
+      ecr_repository:
+        description: 'ECR repository name (Yinatra passes this)'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write    # OIDC — GitHub must request a JWT token
+  contents: read     # Read repo code
+
+# ── Default environment values ────────────────────────────────
+# These are used when workflow is triggered by a direct push.
+# When Yinatra triggers via workflow_dispatch, it overrides
+# these with the actual cluster/service/repo values.
+env:
+  AWS_REGION: ap-south-1
+  AWS_ACCOUNT_ID: "942049393866"
+  ECR_REPOSITORY: yinatra-docker-compose-repo   # ← Change to your ECR repo name
+  ECS_CLUSTER: ai-governance-yinatra            # ← Change to your ECS cluster name
+  ECS_SERVICE: yinatra-docker-compose-service   # ← Change to your ECS service name
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ── Step 1: Checkout code ──────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Step 2: Apply Yinatra dispatch overrides ───────
+      # When Yinatra triggers this workflow, it passes the
+      # correct cluster/service/ECR values as workflow_dispatch
+      # inputs. This step writes them to GITHUB_ENV so they
+      # override the defaults above.
+      - name: Apply Yinatra dispatch overrides
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          [ -n "${{ inputs.ecs_cluster }}"    ] && echo "ECS_CLUSTER=${{ inputs.ecs_cluster }}"       >> $GITHUB_ENV || true
+          [ -n "${{ inputs.ecs_service }}"    ] && echo "ECS_SERVICE=${{ inputs.ecs_service }}"       >> $GITHUB_ENV || true
+          [ -n "${{ inputs.aws_account_id }}" ] && echo "AWS_ACCOUNT_ID=${{ inputs.aws_account_id }}" >> $GITHUB_ENV || true
+          [ -n "${{ inputs.aws_region }}"     ] && echo "AWS_REGION=${{ inputs.aws_region }}"         >> $GITHUB_ENV || true
+          [ -n "${{ inputs.ecr_repository }}" ] && echo "ECR_REPOSITORY=${{ inputs.ecr_repository }}" >> $GITHUB_ENV || true
+
+      # ── Step 3: Configure AWS credentials (OIDC) ──────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-actions-deployer
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Step 4: Login to Amazon ECR ───────────────────
+      # Gets Docker credentials for your private ECR registry.
+      # The registry URL format:
+      #   942049393866.dkr.ecr.ap-south-1.amazonaws.com
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Step 5: Set image tag and full URI ────────────
+      - name: Set image tag and URI
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${GITHUB_SHA:0:7}"
+          fi
+          echo "IMAGE_TAG=$TAG" >> $GITHUB_ENV
+          echo "IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$TAG" >> $GITHUB_ENV
+          echo "Using image: ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$TAG"
+
+      # ── Step 6: Build and push Docker image to ECR ────
+      # Skipped if phase=deploy (re-deploying an existing image)
+      - name: Build and push Docker image to ECR
+        if: ${{ inputs.phase != 'deploy' }}
+        run: |
+          docker build -t $IMAGE_URI .
+          docker push $IMAGE_URI
+          echo "✅ Pushed: $IMAGE_URI"
+
+      # ── Step 7 & 8: Update ECS task definition + service
+      # What is a task definition?
+      #   It's a JSON config that tells ECS:
+      #     - Which image to run (we update this to the new IMAGE_URI)
+      #     - CPU and memory limits
+      #     - Port mappings
+      #     - Environment variables
+      #     - IAM execution role
+      #   Every time you deploy a new image, you register a new
+      #   REVISION of the task definition, then point the service
+      #   at the new revision.
+      - name: Update ECS task definition and deploy service
+        run: |
+          # Get current task definition ARN from the service
+          TASK_DEF_ARN=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          echo "Current task definition: $TASK_DEF_ARN"
+
+          # Download the current task definition JSON,
+          # strip out read-only AWS fields (they can't be re-submitted),
+          # update the image URI in the first container definition
+          NEW_TASK=$(aws ecs describe-task-definition \
+            --task-definition $TASK_DEF_ARN \
+            --query 'taskDefinition' \
+            --output json | \
+            jq --arg IMG "$IMAGE_URI" \
+              'del(
+                .taskDefinitionArn,
+                .revision,
+                .status,
+                .requiresAttributes,
+                .placementConstraints,
+                .compatibilities,
+                .registeredAt,
+                .registeredBy
+              ) |
+              .containerDefinitions[0].image = $IMG')
+
+          # Register the new task definition revision
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "New task definition: $NEW_ARN"
+
+          # Update the ECS service to use the new task definition
+          # ECS will do a rolling replacement of tasks (no downtime)
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --task-definition "$NEW_ARN" \
+            --force-new-deployment
+
+          echo "✅ ECS service updated to: $NEW_ARN"
+
+      # ── Step 9: Wait for ECS service to stabilize ─────
+      # ECS rolls out containers one by one.
+      # This step waits until all tasks are running and healthy.
+      # If tasks keep crashing, this will fail and alert you.
+      - name: Wait for ECS service to stabilize
+        run: |
+          echo "Waiting for ECS service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE
+          echo "✅ ECS service is stable and healthy"
