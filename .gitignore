@@ -1,0 +1,15 @@
+# ============================================================
+# .gitignore
+# Files that must NEVER be pushed to GitHub
+# ============================================================
+
+# Real environment variables (contains secrets)
+.env
+
+# Docker build cache / temp files
+*.tar.gz
+*.tar
+
+# OS junk
+.DS_Store
+Thumbs.db
