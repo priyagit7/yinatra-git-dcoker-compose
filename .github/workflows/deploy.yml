@@ -90,7 +90,7 @@ env:
   IMAGE_NAME: yinatra-docker-compose
   DEPLOY_PATH: /opt/apps/yinatra-docker-compose
   # EC2 Instance ID — replace with your actual instance ID
-  EC2_INSTANCE_ID: "i-REPLACE_WITH_YOUR_INSTANCE_ID"
+  EC2_INSTANCE_ID: "i-04d74b5b869290833"
 
 jobs:
   build-and-deploy:
