@@ -15,10 +15,8 @@ version: "3.9"
 services:
 
   # ── Web / Nginx service ───────────────────────────────────
-  web:
-    build:
-      context: .           # Use the Dockerfile in the same folder
-      dockerfile: Dockerfile
+ web:
+    image: ${IMAGE_NAME:-yinatra-docker-compose}:latest
     container_name: yinatra-web
     restart: unless-stopped   # Auto-restart if container crashes
     ports:
